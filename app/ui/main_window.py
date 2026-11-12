@@ -1,4 +1,4 @@
-﻿"""Main desktop window coordinating sidebar, toolbar, multi-tab PDF viewer, and right inspector."""
+﻿"""Main desktop window coordinating sidebar, toolbar, multi-tab PDF viewer, tools, and right inspector."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QStackedWidget,
     QStatusBar,
     QTabWidget,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import APP_NAME, APP_VERSION, THUMBNAIL_WIDTH_PX
+from app.core.annotation_manager import ANNOTATION_COLORS
 from app.core.document_manager import (
     PdfOpenError,
     PdfPasswordRequiredError,
@@ -36,10 +38,12 @@ from app.core.document_manager import (
 from app.core.pdf_renderer import PdfRenderer
 from app.services.file_service import FileService
 from app.ui.dashboard import DashboardWidget
+from app.ui.organize_view import OrganizeWorkspaceWidget
 from app.ui.pdf_viewer import PdfViewerWidget
 from app.ui.sidebar import Sidebar
 from app.ui.theme import build_stylesheet, get_palette
 from app.ui.toolbar import TopToolbar
+from app.ui.tools_view import ToolsWorkspaceWidget
 
 logger = logging.getLogger("pdf_pro.main_window")
 
@@ -121,16 +125,28 @@ class MainWindow(QMainWindow):
         self.doc_tabs.currentChanged.connect(self._on_tab_changed)
         self.workspace_stack.addWidget(self.doc_tabs)
 
-        # Index 2: Settings View
+        # Index 2: Organize Pages Workspace
+        self.organize_view = OrganizeWorkspaceWidget(self.file_service, self.renderer)
+        self.organize_view.open_pdf_requested.connect(self.open_pdf_file)
+        self.organize_view.status_message.connect(lambda msg: self.status_bar.showMessage(msg, 5000))
+        self.workspace_stack.addWidget(self.organize_view)
+
+        # Index 3: PDF Utilities Workspace
+        self.tools_view = ToolsWorkspaceWidget(self.file_service)
+        self.tools_view.open_pdf_requested.connect(self.open_pdf_file)
+        self.tools_view.status_message.connect(lambda msg: self.status_bar.showMessage(msg, 5000))
+        self.workspace_stack.addWidget(self.tools_view)
+
+        # Index 4: Settings View
         self.settings_view = self._build_settings_view()
         self.workspace_stack.addWidget(self.settings_view)
 
         body_row.addWidget(self.workspace_stack, stretch=1)
 
-        # Right Inspector Panel (Thumbnails + Document Properties)
+        # Right Inspector Panel (Stacked: Thumbnails vs Annotation Tools)
         self.right_panel = QFrame()
         self.right_panel.setObjectName("RightPanel")
-        self.right_panel.setFixedWidth(260)
+        self.right_panel.setFixedWidth(265)
         rp_layout = QVBoxLayout(self.right_panel)
         rp_layout.setContentsMargins(12, 12, 12, 12)
         rp_layout.setSpacing(10)
@@ -139,11 +155,19 @@ class MainWindow(QMainWindow):
         self.right_panel_title.setProperty("class", "section-title")
         rp_layout.addWidget(self.right_panel_title)
 
+        self.right_stack = QStackedWidget()
+
+        # Right Stack 0: Page Thumbnails
         self.thumbnail_list = QListWidget()
         self.thumbnail_list.setIconSize(QSize(THUMBNAIL_WIDTH_PX, 190))
         self.thumbnail_list.setSpacing(6)
         self.thumbnail_list.itemClicked.connect(self._on_thumbnail_clicked)
-        rp_layout.addWidget(self.thumbnail_list, stretch=1)
+        self.right_stack.addWidget(self.thumbnail_list)
+
+        # Right Stack 1: Annotation Controls
+        self.right_stack.addWidget(self._build_annotation_panel())
+
+        rp_layout.addWidget(self.right_stack, stretch=1)
 
         self.doc_info_label = QLabel("No document open")
         self.doc_info_label.setProperty("class", "muted")
@@ -160,6 +184,64 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready  •  Offline Local Mode")
+
+    def _build_annotation_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(8)
+
+        hint = QLabel(
+            "Choose a tool below, then drag across the PDF page. "
+            "Annotations are non-destructive markups—use Save Copy (Ctrl+S) to export."
+        )
+        hint.setProperty("class", "muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Color:"))
+        self.annot_color_combo = QComboBox()
+        self.annot_color_combo.addItems(list(ANNOTATION_COLORS.keys()))
+        self.annot_color_combo.currentTextChanged.connect(self._apply_selected_annot_tool)
+        color_row.addWidget(self.annot_color_combo, stretch=1)
+        layout.addLayout(color_row)
+
+        self.annot_tool_combo = QComboBox()
+        self._annot_modes = [
+            ("select", "Select & Copy Text (Default)"),
+            ("highlight", "Highlight Region"),
+            ("underline", "Underline Text"),
+            ("strikeout", "Strike-through Text"),
+            ("sticky_note", "Sticky Note Comment"),
+            ("freetext", "Free Text Box"),
+            ("rectangle", "Rectangle Box"),
+        ]
+        for _, label in self._annot_modes:
+            self.annot_tool_combo.addItem(label)
+        self.annot_tool_combo.currentIndexChanged.connect(self._apply_selected_annot_tool)
+        layout.addWidget(self.annot_tool_combo)
+
+        btn_undo_annot = QPushButton("Undo Last Annotation on Page")
+        btn_undo_annot.clicked.connect(
+            lambda: self._with_viewer(lambda v: v.undo_last_annotation())
+        )
+        layout.addWidget(btn_undo_annot)
+
+        btn_save_annot = QPushButton("Save Annotated PDF As...")
+        btn_save_annot.setObjectName("PrimaryBtn")
+        btn_save_annot.clicked.connect(self.save_copy_dialog)
+        layout.addWidget(btn_save_annot)
+
+        layout.addStretch()
+        return panel
+
+    def _apply_selected_annot_tool(self) -> None:
+        idx = self.annot_tool_combo.currentIndex()
+        mode = self._annot_modes[idx][0]
+        color = self.annot_color_combo.currentText()
+        self._with_viewer(lambda v: v.set_interaction_mode(mode, color))
+        self.status_bar.showMessage(f"Tool active: {self._annot_modes[idx][1]} ({color})", 3000)
 
     def _build_settings_view(self) -> QWidget:
         page = QWidget()
@@ -243,17 +325,37 @@ class MainWindow(QMainWindow):
         self.sidebar.select_item(key, emit_signal=True)
 
     def _on_navigation_changed(self, key: str) -> None:
+        viewer = self._current_viewer()
         if key in ("home", "recent"):
             self.dashboard.refresh_recent_files()
             self.workspace_stack.setCurrentWidget(self.dashboard)
+            self.right_stack.setCurrentIndex(0)
+        elif key == "organize":
+            self.organize_view.bind_session(viewer.session if viewer else None)
+            self.workspace_stack.setCurrentWidget(self.organize_view)
+            self.right_stack.setCurrentIndex(0)
+        elif key == "tools":
+            self.tools_view.bind_session(viewer.session if viewer else None)
+            self.workspace_stack.setCurrentWidget(self.tools_view)
+            self.right_stack.setCurrentIndex(0)
         elif key == "settings":
             self.workspace_stack.setCurrentWidget(self.settings_view)
+            self.right_stack.setCurrentIndex(0)
+        elif key == "editor":
+            self.workspace_stack.setCurrentWidget(self.doc_tabs)
+            self.right_panel.setVisible(True)
+            self.right_stack.setCurrentIndex(1)
+            if self.annot_tool_combo.currentIndex() == 0:
+                self.annot_tool_combo.setCurrentIndex(1)  # Default to Highlight when entering Editor
+            self._apply_selected_annot_tool()
         else:
             if self.doc_tabs.count() == 0:
                 self.status_bar.showMessage(
                     f"Switched to {key.title()} — open a PDF to begin.", 4000
                 )
             self.workspace_stack.setCurrentWidget(self.doc_tabs)
+            self.right_stack.setCurrentIndex(0)
+            self._with_viewer(lambda v: v.set_interaction_mode("select"))
 
         panel_titles = {
             "reader": "Page Thumbnails",
@@ -289,7 +391,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Unsupported File", "Please select a valid .pdf file.")
             return
 
-        # Focus existing tab if already open
         for i in range(self.doc_tabs.count()):
             w = self.doc_tabs.widget(i)
             if isinstance(w, PdfViewerWidget) and w.session.file_path == path.resolve():
@@ -320,16 +421,20 @@ class MainWindow(QMainWindow):
         viewer.page_changed.connect(self._on_viewer_page_changed)
         viewer.zoom_changed.connect(self.toolbar.update_zoom_label)
         viewer.status_message.connect(lambda msg: self.status_bar.showMessage(msg, 5000))
+        viewer.document_modified.connect(lambda: self._populate_inspector_for_viewer(viewer))
 
         idx = self.doc_tabs.addTab(viewer, session.name)
         self.doc_tabs.setCurrentIndex(idx)
         self.toolbar.set_document_controls_enabled(True)
         self.sidebar.select_item("reader", emit_signal=False)
         self.workspace_stack.setCurrentWidget(self.doc_tabs)
+        self.right_stack.setCurrentIndex(0)
 
         self.file_service.add_recent_file(path, page_count=session.page_count)
         self.dashboard.refresh_recent_files()
         self._populate_inspector_for_viewer(viewer)
+        self.organize_view.bind_session(session)
+        self.tools_view.bind_session(session)
         self.status_bar.showMessage(
             f"Opened {session.name} ({session.page_count} pages)"
         )
@@ -340,6 +445,8 @@ class MainWindow(QMainWindow):
             self.toolbar.set_document_controls_enabled(False)
             self.thumbnail_list.clear()
             self.doc_info_label.setText("No document open")
+            self.organize_view.bind_session(None)
+            self.tools_view.bind_session(None)
             return
 
         self.toolbar.set_document_controls_enabled(True)
@@ -348,6 +455,8 @@ class MainWindow(QMainWindow):
         )
         self.toolbar.update_zoom_label(viewer.session.zoom)
         self._populate_inspector_for_viewer(viewer)
+        self.organize_view.bind_session(viewer.session)
+        self.tools_view.bind_session(viewer.session)
 
     def _on_viewer_page_changed(self, current_1based: int, total: int) -> None:
         self.toolbar.update_page_state(current_1based, total)
@@ -355,10 +464,9 @@ class MainWindow(QMainWindow):
             self.thumbnail_list.setCurrentRow(current_1based - 1)
 
     def _populate_inspector_for_viewer(self, viewer: PdfViewerWidget) -> None:
-        """Load page thumbnails (capped for responsiveness) and document metadata."""
         self.thumbnail_list.clear()
         total = viewer.session.page_count
-        preview_limit = min(total, 60)  # Keep RAM low on huge PDFs
+        preview_limit = min(total, 60)
         for page_idx in range(preview_limit):
             thumb = self.renderer.render_thumbnail(viewer.session.doc, page_idx)
             item = QListWidgetItem(QIcon(thumb), f"Page {page_idx + 1}")
@@ -427,6 +535,8 @@ class MainWindow(QMainWindow):
             widget.deleteLater()
         if self.doc_tabs.count() == 0:
             self.toolbar.set_document_controls_enabled(False)
+            self.organize_view.bind_session(None)
+            self.tools_view.bind_session(None)
             self.sidebar.select_item("home", emit_signal=True)
 
     def _close_current_tab(self) -> None:

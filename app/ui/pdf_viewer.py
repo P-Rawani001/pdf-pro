@@ -1,4 +1,4 @@
-﻿"""Interactive PDF page canvas with zoom, fit modes, search highlights, and text selection."""
+﻿"""Interactive PDF page canvas with zoom, fit modes, search highlights, text selection, and annotations."""
 
 from __future__ import annotations
 
@@ -14,22 +14,29 @@ from PySide6.QtGui import (
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
+    QInputDialog,
     QLabel,
     QMenu,
+    QMessageBox,
     QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
 from app.config import DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM, RENDER_DPI_BASE, ZOOM_STEP
+from app.core.annotation_manager import (
+    PdfAnnotationError,
+    add_rect_markup,
+    undo_last_annotation_on_page,
+)
 from app.core.document_manager import PdfDocumentSession, SearchHit
 from app.core.pdf_renderer import PdfRenderer
 
 
 class PageCanvasLabel(QLabel):
-    """Displays a rendered PDF page and supports drag-rectangle text selection."""
+    """Displays a rendered PDF page and captures drag rectangles for text copy or annotations."""
 
-    text_selected = Signal(str)
+    region_dragged = Signal(QRect, str)  # (pixel rect, 'auto' or 'copy_now')
     copy_page_requested = Signal()
 
     def __init__(self, parent=None) -> None:
@@ -67,8 +74,7 @@ class PageCanvasLabel(QLabel):
             self._end_pt = event.position().toPoint()
             self._selection_rect = QRect(self._start_pt, self._end_pt).normalized()
             self.update()
-            if self._selection_rect.width() > 6 and self._selection_rect.height() > 6:
-                self.text_selected.emit("selected")
+            self.region_dragged.emit(self._selection_rect, "auto")
         super().mouseReleaseEvent(event)
 
     def paintEvent(self, event) -> None:
@@ -84,7 +90,9 @@ class PageCanvasLabel(QLabel):
         menu = QMenu(self)
         act_copy_sel = QAction("Copy Selected Region Text", self)
         act_copy_sel.setEnabled(not self._selection_rect.isNull())
-        act_copy_sel.triggered.connect(lambda: self.text_selected.emit("copy_now"))
+        act_copy_sel.triggered.connect(
+            lambda: self.region_dragged.emit(self._selection_rect, "copy_now")
+        )
 
         act_copy_page = QAction("Copy Entire Page Text", self)
         act_copy_page.triggered.connect(self.copy_page_requested.emit)
@@ -95,11 +103,12 @@ class PageCanvasLabel(QLabel):
 
 
 class PdfViewerWidget(QScrollArea):
-    """Scrollable single-tab PDF viewer supporting zoom, search, navigation, and text copy."""
+    """Scrollable single-tab PDF viewer supporting zoom, search, text copy, and annotations."""
 
-    page_changed = Signal(int, int)       # (1-based current page, total pages)
-    zoom_changed = Signal(float)          # current zoom factor
-    status_message = Signal(str)          # status bar feedback
+    page_changed = Signal(int, int)
+    zoom_changed = Signal(float)
+    status_message = Signal(str)
+    document_modified = Signal()
 
     def __init__(self, session: PdfDocumentSession, renderer: PdfRenderer, parent=None) -> None:
         super().__init__(parent)
@@ -108,6 +117,8 @@ class PdfViewerWidget(QScrollArea):
         self._search_hits: list[SearchHit] = []
         self._current_hit_index: int = -1
         self._last_selected_text: str = ""
+        self._interaction_mode: str = "select"  # 'select', 'highlight', 'underline', 'strikeout', 'rectangle', 'sticky_note', 'freetext'
+        self._annot_color: str = "Yellow"
 
         self.setWidgetResizable(True)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -118,15 +129,24 @@ class PdfViewerWidget(QScrollArea):
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.canvas = PageCanvasLabel()
-        self.canvas.text_selected.connect(self._on_canvas_selection)
+        self.canvas.region_dragged.connect(self._on_region_dragged)
         self.canvas.copy_page_requested.connect(self.copy_current_page_text)
         layout.addWidget(self.canvas)
 
         self.setWidget(container)
         self.render_current_page()
 
+    def set_interaction_mode(self, mode: str, color_name: str = "Yellow") -> None:
+        self._interaction_mode = mode
+        self._annot_color = color_name
+        cursor = (
+            Qt.CursorShape.IBeamCursor
+            if mode == "select"
+            else Qt.CursorShape.CrossCursor
+        )
+        self.canvas.setCursor(cursor)
+
     def render_current_page(self) -> None:
-        """Render the active page with any active search highlights."""
         page_idx = self.session.current_page
         page_highlights = [
             h.rect for h in self._search_hits if h.page_index == page_idx
@@ -173,14 +193,12 @@ class PdfViewerWidget(QScrollArea):
         self.set_zoom(DEFAULT_ZOOM)
 
     def fit_width(self) -> None:
-        """Scale page so its width fits comfortably inside the viewport."""
         page_w_pt, _ = self.session.get_page_size_points(self.session.current_page)
         base_px = page_w_pt * (RENDER_DPI_BASE / 72.0)
         available_w = max(200, self.viewport().width() - 64)
         self.set_zoom(available_w / max(1.0, base_px))
 
     def fit_page(self) -> None:
-        """Scale page so the entire page fits inside the viewport."""
         page_w_pt, page_h_pt = self.session.get_page_size_points(self.session.current_page)
         scale_base = RENDER_DPI_BASE / 72.0
         avail_w = max(200, self.viewport().width() - 64)
@@ -190,7 +208,6 @@ class PdfViewerWidget(QScrollArea):
         self.set_zoom(min(zoom_w, zoom_h))
 
     def search(self, query: str) -> None:
-        """Find text across the document and jump to the next match."""
         cleaned = query.strip()
         if not cleaned:
             self._search_hits.clear()
@@ -199,7 +216,6 @@ class PdfViewerWidget(QScrollArea):
             self.status_message.emit("Search cleared.")
             return
 
-        # Cycle through existing hits if query is unchanged
         if (
             self._search_hits
             and getattr(self, "_last_query", "") == cleaned.lower()
@@ -223,10 +239,7 @@ class PdfViewerWidget(QScrollArea):
             f"(Page {hit.page_index + 1})"
         )
 
-    def _on_canvas_selection(self, mode: str) -> None:
-        rect = self.canvas._selection_rect
-        if rect.isNull() or not rect.isValid():
-            return
+    def _on_region_dragged(self, rect: QRect, action_mode: str) -> None:
         scale = (RENDER_DPI_BASE / 72.0) * self.session.zoom
         pdf_rect = pymupdf.Rect(
             rect.left() / scale,
@@ -234,14 +247,62 @@ class PdfViewerWidget(QScrollArea):
             rect.right() / scale,
             rect.bottom() / scale,
         )
-        extracted = self.session.extract_text_in_rect(self.session.current_page, pdf_rect)
-        self._last_selected_text = extracted
-        if extracted:
-            QGuiApplication.clipboard().setText(extracted)
-            preview = extracted[:60].replace("\n", " ")
-            self.status_message.emit(f"Copied to clipboard: \"{preview}...\"")
-        elif mode == "copy_now":
-            self.status_message.emit("No selectable text in drawn region (page may be scanned).")
+
+        # Text Selection & Copy Mode
+        if self._interaction_mode == "select" or action_mode == "copy_now":
+            if rect.width() <= 6 or rect.height() <= 6:
+                return
+            extracted = self.session.extract_text_in_rect(self.session.current_page, pdf_rect)
+            self._last_selected_text = extracted
+            if extracted:
+                QGuiApplication.clipboard().setText(extracted)
+                preview = extracted[:60].replace("\n", " ")
+                self.status_message.emit(f"Copied to clipboard: \"{preview}...\"")
+            elif action_mode == "copy_now":
+                self.status_message.emit("No selectable text in drawn region (page may be scanned).")
+            return
+
+        # Annotation Creation Mode
+        note_text = ""
+        if self._interaction_mode in ("sticky_note", "freetext"):
+            prompt_title = "Sticky Note Content" if self._interaction_mode == "sticky_note" else "Text Box Content"
+            txt, ok = QInputDialog.getText(self, prompt_title, "Enter annotation text:")
+            if not ok or not txt.strip():
+                self.canvas.clear_selection()
+                return
+            note_text = txt.strip()
+        elif rect.width() <= 4 or rect.height() <= 4:
+            self.canvas.clear_selection()
+            return
+
+        try:
+            add_rect_markup(
+                self.session.doc,
+                self.session.current_page,
+                pdf_rect,
+                tool_type=self._interaction_mode,
+                color_name=self._annot_color,
+                note_text=note_text,
+            )
+            self.session.is_dirty = True
+            self.canvas.clear_selection()
+            self.renderer.invalidate_document(self.session.doc)
+            self.render_current_page()
+            self.document_modified.emit()
+            self.status_message.emit(
+                f"Added {self._interaction_mode.replace('_', ' ')} on Page {self.session.current_page + 1} (use Save Copy to export)."
+            )
+        except PdfAnnotationError as exc:
+            QMessageBox.warning(self, "Annotation Failed", str(exc))
+
+    def undo_last_annotation(self) -> None:
+        if undo_last_annotation_on_page(self.session.doc, self.session.current_page):
+            self.renderer.invalidate_document(self.session.doc)
+            self.render_current_page()
+            self.document_modified.emit()
+            self.status_message.emit("Removed last annotation on current page.")
+        else:
+            self.status_message.emit("No annotations to undo on this page.")
 
     def copy_selected_or_page_text(self) -> None:
         if self._last_selected_text:
