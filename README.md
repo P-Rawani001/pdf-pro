@@ -1,6 +1,8 @@
 <div align="center">
 
-# 📄 PDF Pro
+<img src="assets/logo.png" alt="PDF Pro logo" width="120">
+
+# PDF Pro
 
 ### A local-first, offline PDF suite for Windows
 
