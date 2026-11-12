@@ -1,0 +1,5 @@
+PDF Pro - Local-First Windows PDF Suite
+Copyright (C) 2026 Pankaj Kumar Rawani
+
+This distribution bundles PyMuPDF (GNU AGPL-3.0) and PySide6 (GNU LGPL-3.0), alongside pypdf (BSD-3-Clause), Pillow (HPND), and Requests (Apache-2.0).
+When distributed in binary form, the complete corresponding source code is licensed under GNU AGPL-3.0 (https://www.gnu.org/licenses/agpl-3.0.html).
