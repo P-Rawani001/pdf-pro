@@ -36,7 +36,7 @@ from app.core.pdf_renderer import PdfRenderer
 class PageCanvasLabel(QLabel):
     """Displays a rendered PDF page and captures drag rectangles for text copy or annotations."""
 
-    region_dragged = Signal(QRect, str)  # (pixel rect, 'auto' or 'copy_now')
+    region_dragged = Signal(QRect, str)
     copy_page_requested = Signal()
 
     def __init__(self, parent=None) -> None:
@@ -109,6 +109,7 @@ class PdfViewerWidget(QScrollArea):
     zoom_changed = Signal(float)
     status_message = Signal(str)
     document_modified = Signal()
+    text_selection_changed = Signal(str)
 
     def __init__(self, session: PdfDocumentSession, renderer: PdfRenderer, parent=None) -> None:
         super().__init__(parent)
@@ -117,7 +118,7 @@ class PdfViewerWidget(QScrollArea):
         self._search_hits: list[SearchHit] = []
         self._current_hit_index: int = -1
         self._last_selected_text: str = ""
-        self._interaction_mode: str = "select"  # 'select', 'highlight', 'underline', 'strikeout', 'rectangle', 'sticky_note', 'freetext'
+        self._interaction_mode: str = "select"
         self._annot_color: str = "Yellow"
 
         self.setWidgetResizable(True)
@@ -248,12 +249,12 @@ class PdfViewerWidget(QScrollArea):
             rect.bottom() / scale,
         )
 
-        # Text Selection & Copy Mode
         if self._interaction_mode == "select" or action_mode == "copy_now":
             if rect.width() <= 6 or rect.height() <= 6:
                 return
             extracted = self.session.extract_text_in_rect(self.session.current_page, pdf_rect)
             self._last_selected_text = extracted
+            self.text_selection_changed.emit(extracted)
             if extracted:
                 QGuiApplication.clipboard().setText(extracted)
                 preview = extracted[:60].replace("\n", " ")
@@ -262,7 +263,6 @@ class PdfViewerWidget(QScrollArea):
                 self.status_message.emit("No selectable text in drawn region (page may be scanned).")
             return
 
-        # Annotation Creation Mode
         note_text = ""
         if self._interaction_mode in ("sticky_note", "freetext"):
             prompt_title = "Sticky Note Content" if self._interaction_mode == "sticky_note" else "Text Box Content"

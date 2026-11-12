@@ -1,4 +1,4 @@
-﻿"""Main desktop window coordinating sidebar, toolbar, multi-tab PDF viewer, tools, and right inspector."""
+﻿"""Main desktop window coordinating sidebar, toolbar, multi-tab PDF viewer, tools, and AI inspector."""
 
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ from app.core.document_manager import (
 )
 from app.core.pdf_renderer import PdfRenderer
 from app.services.file_service import FileService
+from app.ui.ai_panel import AiAssistantPanel
 from app.ui.dashboard import DashboardWidget
 from app.ui.organize_view import OrganizeWorkspaceWidget
 from app.ui.pdf_viewer import PdfViewerWidget
@@ -58,7 +59,7 @@ class MainWindow(QMainWindow):
         self.renderer = PdfRenderer()
 
         self.setWindowTitle(f"{APP_NAME} — Local Document Suite")
-        self.resize(1360, 860)
+        self.resize(1380, 860)
         self.setMinimumSize(1024, 680)
         self.setAcceptDrops(True)
 
@@ -73,18 +74,15 @@ class MainWindow(QMainWindow):
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
 
-        # Left Navigation Rail
         self.sidebar = Sidebar()
         self.sidebar.navigation_changed.connect(self._on_navigation_changed)
         outer_layout.addWidget(self.sidebar)
 
-        # Center + Right Container
         right_container = QWidget()
         center_vbox = QVBoxLayout(right_container)
         center_vbox.setContentsMargins(0, 0, 0, 0)
         center_vbox.setSpacing(0)
 
-        # Top Toolbar
         self.toolbar = TopToolbar()
         self.toolbar.open_requested.connect(self.open_file_dialog)
         self.toolbar.save_as_requested.connect(self.save_copy_dialog)
@@ -103,7 +101,6 @@ class MainWindow(QMainWindow):
         self.toolbar.toggle_right_panel_requested.connect(self._toggle_right_panel)
         center_vbox.addWidget(self.toolbar)
 
-        # Workspace Splitter Row
         body_row = QHBoxLayout()
         body_row.setContentsMargins(0, 0, 0, 0)
         body_row.setSpacing(0)
@@ -143,10 +140,10 @@ class MainWindow(QMainWindow):
 
         body_row.addWidget(self.workspace_stack, stretch=1)
 
-        # Right Inspector Panel (Stacked: Thumbnails vs Annotation Tools)
+        # Right Inspector Panel (0: Thumbnails, 1: Annotations, 2: Local AI Assistant)
         self.right_panel = QFrame()
         self.right_panel.setObjectName("RightPanel")
-        self.right_panel.setFixedWidth(265)
+        self.right_panel.setFixedWidth(300)
         rp_layout = QVBoxLayout(self.right_panel)
         rp_layout.setContentsMargins(12, 12, 12, 12)
         rp_layout.setSpacing(10)
@@ -157,15 +154,17 @@ class MainWindow(QMainWindow):
 
         self.right_stack = QStackedWidget()
 
-        # Right Stack 0: Page Thumbnails
         self.thumbnail_list = QListWidget()
         self.thumbnail_list.setIconSize(QSize(THUMBNAIL_WIDTH_PX, 190))
         self.thumbnail_list.setSpacing(6)
         self.thumbnail_list.itemClicked.connect(self._on_thumbnail_clicked)
         self.right_stack.addWidget(self.thumbnail_list)
 
-        # Right Stack 1: Annotation Controls
         self.right_stack.addWidget(self._build_annotation_panel())
+
+        self.ai_panel = AiAssistantPanel(self.file_service)
+        self.ai_panel.status_message.connect(lambda msg: self.status_bar.showMessage(msg, 5000))
+        self.right_stack.addWidget(self.ai_panel)
 
         rp_layout.addWidget(self.right_stack, stretch=1)
 
@@ -180,7 +179,6 @@ class MainWindow(QMainWindow):
         center_vbox.addLayout(body_row, stretch=1)
         outer_layout.addWidget(right_container, stretch=1)
 
-        # Status Bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready  •  Offline Local Mode")
@@ -273,7 +271,7 @@ class MainWindow(QMainWindow):
 
         privacy_note = QLabel(
             f"{APP_NAME} v{APP_VERSION} processes all PDFs locally on Windows. "
-            "Memory guardrails limit pixmap caching for smooth performance on 8 GB RAM systems."
+            "Optional AI features connect exclusively to local Ollama (http://127.0.0.1:11434)."
         )
         privacy_note.setProperty("class", "muted")
         privacy_note.setWordWrap(True)
@@ -346,8 +344,14 @@ class MainWindow(QMainWindow):
             self.right_panel.setVisible(True)
             self.right_stack.setCurrentIndex(1)
             if self.annot_tool_combo.currentIndex() == 0:
-                self.annot_tool_combo.setCurrentIndex(1)  # Default to Highlight when entering Editor
+                self.annot_tool_combo.setCurrentIndex(1)
             self._apply_selected_annot_tool()
+        elif key == "ai":
+            self.workspace_stack.setCurrentWidget(self.doc_tabs)
+            self.right_panel.setVisible(True)
+            self.right_stack.setCurrentIndex(2)
+            self.ai_panel.bind_session(viewer.session if viewer else None)
+            self._with_viewer(lambda v: v.set_interaction_mode("select"))
         else:
             if self.doc_tabs.count() == 0:
                 self.status_bar.showMessage(
@@ -422,6 +426,7 @@ class MainWindow(QMainWindow):
         viewer.zoom_changed.connect(self.toolbar.update_zoom_label)
         viewer.status_message.connect(lambda msg: self.status_bar.showMessage(msg, 5000))
         viewer.document_modified.connect(lambda: self._populate_inspector_for_viewer(viewer))
+        viewer.text_selection_changed.connect(self.ai_panel.set_selected_text)
 
         idx = self.doc_tabs.addTab(viewer, session.name)
         self.doc_tabs.setCurrentIndex(idx)
@@ -435,6 +440,7 @@ class MainWindow(QMainWindow):
         self._populate_inspector_for_viewer(viewer)
         self.organize_view.bind_session(session)
         self.tools_view.bind_session(session)
+        self.ai_panel.bind_session(session)
         self.status_bar.showMessage(
             f"Opened {session.name} ({session.page_count} pages)"
         )
@@ -447,6 +453,7 @@ class MainWindow(QMainWindow):
             self.doc_info_label.setText("No document open")
             self.organize_view.bind_session(None)
             self.tools_view.bind_session(None)
+            self.ai_panel.bind_session(None)
             return
 
         self.toolbar.set_document_controls_enabled(True)
@@ -457,6 +464,7 @@ class MainWindow(QMainWindow):
         self._populate_inspector_for_viewer(viewer)
         self.organize_view.bind_session(viewer.session)
         self.tools_view.bind_session(viewer.session)
+        self.ai_panel.bind_session(viewer.session)
 
     def _on_viewer_page_changed(self, current_1based: int, total: int) -> None:
         self.toolbar.update_page_state(current_1based, total)
@@ -537,6 +545,7 @@ class MainWindow(QMainWindow):
             self.toolbar.set_document_controls_enabled(False)
             self.organize_view.bind_session(None)
             self.tools_view.bind_session(None)
+            self.ai_panel.bind_session(None)
             self.sidebar.select_item("home", emit_signal=True)
 
     def _close_current_tab(self) -> None:
